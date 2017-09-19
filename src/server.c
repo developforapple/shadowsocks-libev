@@ -94,7 +94,7 @@ static void block_list_clear_cb(EV_P_ ev_timer *watcher, int revents);
 
 static remote_t *new_remote(int fd);
 static server_t *new_server(int fd, listen_ctx_t *listener);
-static remote_t *connect_to_remote(struct addrinfo *res,
+static remote_t *connect_to_remote(EV_P_ struct addrinfo *res,
                                    server_t *server);
 
 static void free_remote(remote_t *remote);
@@ -104,14 +104,12 @@ static void close_and_free_server(EV_P_ server_t *server);
 static void server_resolve_cb(struct sockaddr *addr, void *data);
 static void query_free_cb(void *data);
 
-static size_t parse_header_len(const char atyp, const char *data, size_t offset);
 static int is_header_complete(const buffer_t *buf);
 
 int verbose = 0;
 
 static int acl       = 0;
 static int mode      = TCP_ONLY;
-static int auth      = 0;
 static int ipv6first = 0;
 
 static int fast_open = 0;
@@ -134,7 +132,10 @@ static struct cork_dllist connections;
 static void
 stat_update_cb(EV_P_ ev_timer *watcher, int revents)
 {
+#ifndef __MINGW32__
     struct sockaddr_un svaddr, claddr;
+#endif
+
     int sfd = -1;
     size_t msgLen;
     char resp[BUF_SIZE];
@@ -150,6 +151,7 @@ stat_update_cb(EV_P_ ev_timer *watcher, int revents)
     parse_addr(manager_address, &ip_addr);
 
     if (ip_addr.host == NULL || ip_addr.port == NULL) {
+#ifndef __MINGW32__
         sfd = socket(AF_UNIX, SOCK_DGRAM, 0);
         if (sfd == -1) {
             ERROR("stat_socket");
@@ -180,10 +182,14 @@ stat_update_cb(EV_P_ ev_timer *watcher, int revents)
         }
 
         unlink(claddr.sun_path);
+#else
+        ERROR("unsupported platform");
+        return;
+#endif
     } else {
         struct sockaddr_storage storage;
         memset(&storage, 0, sizeof(struct sockaddr_storage));
-        if (get_sockaddr(ip_addr.host, ip_addr.port, &storage, 0) == -1) {
+        if (get_sockaddr(ip_addr.host, ip_addr.port, &storage, 0, ipv6first) == -1) {
             ERROR("failed to parse the manager addr");
             return;
         }
@@ -219,27 +225,6 @@ free_connections(struct ev_loop *loop)
     }
 }
 
-static size_t
-parse_header_len(const char atyp, const char *data, size_t offset)
-{
-    size_t len = 0;
-    if ((atyp & ADDRTYPE_MASK) == 1) {
-        // IP V4
-        len += sizeof(struct in_addr);
-    } else if ((atyp & ADDRTYPE_MASK) == 3) {
-        // Domain name
-        uint8_t name_len = *(uint8_t *)(data + offset);
-        len += name_len + 1;
-    } else if ((atyp & ADDRTYPE_MASK) == 4) {
-        // IP V6
-        len += sizeof(struct in6_addr);
-    } else {
-        return 0;
-    }
-    len += 2;
-    return len;
-}
-
 static int
 is_header_complete(const buffer_t *buf)
 {
@@ -271,11 +256,6 @@ is_header_complete(const buffer_t *buf)
     // len of port
     header_len += 2;
 
-    // size of ONETIMEAUTH_BYTES
-    if (auth || (atyp & ONETIMEAUTH_FLAG)) {
-        header_len += ONETIMEAUTH_BYTES;
-    }
-
     return buf_len >= header_len ? 1 : 0;
 }
 
@@ -284,7 +264,7 @@ get_peer_name(int fd)
 {
     static char peer_name[INET6_ADDRSTRLEN] = { 0 };
     struct sockaddr_storage addr;
-    socklen_t len = sizeof addr;
+    socklen_t len = sizeof(struct sockaddr_storage);
     memset(&addr, 0, len);
     memset(peer_name, 0, INET6_ADDRSTRLEN);
     int err = getpeername(fd, (struct sockaddr *)&addr, &len);
@@ -302,6 +282,18 @@ get_peer_name(int fd)
     return peer_name;
 }
 
+#ifdef __linux__
+static void
+set_linger(int fd)
+{
+    struct linger so_linger;
+    memset(&so_linger, 0, sizeof(struct linger));
+    so_linger.l_onoff  = 1;
+    so_linger.l_linger = 0;
+    setsockopt(fd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof so_linger);
+}
+#endif
+
 static void
 reset_addr(int fd)
 {
@@ -315,14 +307,15 @@ reset_addr(int fd)
 static void
 report_addr(int fd, int err_level)
 {
+#ifdef __linux__
+    set_linger(fd);
+#endif
+
     char *peer_name;
     peer_name = get_peer_name(fd);
     if (peer_name != NULL) {
         LOGE("failed to handshake with %s", peer_name);
-        // Block all requests from this IP, if the err# exceeds 128.
-        if (check_block_list(peer_name, err_level)) {
-            LOGE("add %s to block list", peer_name);
-        }
+        update_block_list(peer_name, err_level);
     }
 }
 
@@ -342,6 +335,7 @@ setfastopen(int fd)
         if (s == -1) {
             if (errno == EPROTONOSUPPORT || errno == ENOPROTOOPT) {
                 LOGE("fast open is not supported on this platform");
+                fast_open = 0;
             } else {
                 ERROR("setsockopt");
             }
@@ -463,7 +457,7 @@ create_and_bind(const char *host, const char *port, int mptcp)
 }
 
 static remote_t *
-connect_to_remote(struct addrinfo *res,
+connect_to_remote(EV_P_ struct addrinfo *res,
                   server_t *server)
 {
     int sockfd;
@@ -505,23 +499,29 @@ connect_to_remote(struct addrinfo *res,
 #endif
     setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    remote_t *remote = new_remote(sockfd);
-
     // setup remote socks
 
     if (setnonblocking(sockfd) == -1)
         ERROR("setnonblocking");
 
     if (bind_address != NULL)
-        if (bind_to_address(sockfd, bind_address) == -1)
+        if (bind_to_address(sockfd, bind_address) == -1) {
             ERROR("bind_to_address");
+            close(sockfd);
+            return NULL;
+        }
 
 #ifdef SET_INTERFACE
     if (iface) {
-        if (setinterface(sockfd, iface) == -1)
+        if (setinterface(sockfd, iface) == -1) {
             ERROR("setinterface");
+            close(sockfd);
+            return NULL;
+        }
     }
 #endif
+
+    remote_t *remote = new_remote(sockfd);
 
 #ifdef TCP_FASTOPEN
     if (fast_open) {
@@ -574,7 +574,7 @@ connect_to_remote(struct addrinfo *res,
 
         if (r == -1 && errno != CONNECT_IN_PROGRESS) {
             ERROR("connect");
-            close(sockfd);
+            close_and_free_remote(EV_A_ remote);
             return NULL;
         }
     }
@@ -592,7 +592,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     int len       = server->buf->len;
     buffer_t *buf = server->buf;
 
-    if (server->stage > 2) {
+    if (server->stage > STAGE_PARSE) {
         remote = server->remote;
         buf    = remote->buf;
         len    = 0;
@@ -632,16 +632,16 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 
     tx += r;
 
-    if (server->stage == -1) {
+    if (server->stage == STAGE_ERROR) {
         server->buf->len = 0;
         server->buf->idx = 0;
         return;
     }
 
     // handle incomplete header part 1
-    if (server->stage == 0) {
+    if (server->stage == STAGE_INIT) {
         buf->len += r;
-        if (buf->len <= enc_get_iv_len() + 1) {
+        if (buf->len <= enc_get_iv_len(&cipher_env) + 1) {
             // wait for more
             return;
         }
@@ -649,7 +649,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         buf->len = r;
     }
 
-    int err = ss_decrypt(buf, server->d_ctx, BUF_SIZE);
+    int err = ss_decrypt(&cipher_env, buf, server->d_ctx, BUF_SIZE);
 
     if (err) {
         report_addr(server->fd, MALICIOUS);
@@ -659,24 +659,24 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     }
 
     // handle incomplete header part 2
-    if (server->stage == 0) {
+    if (server->stage == STAGE_INIT) {
         int ret = is_header_complete(server->buf);
         if (ret == 1) {
             bfree(server->header_buf);
             ss_free(server->header_buf);
-            server->stage = 2;
+            server->stage = STAGE_PARSE;
         } else if (ret == -1) {
-            server->stage = -1;
+            server->stage = STAGE_ERROR;
             report_addr(server->fd, MALFORMED);
             server->buf->len = 0;
             server->buf->idx = 0;
             return;
         } else {
-            server->stage = 1;
+            server->stage = STAGE_HANDSHAKE;
         }
     }
 
-    if (server->stage == 1) {
+    if (server->stage == STAGE_HANDSHAKE) {
         size_t header_len = server->header_buf->len;
         brealloc(server->header_buf, server->buf->len + header_len, BUF_SIZE);
         memcpy(server->header_buf->array + header_len,
@@ -691,9 +691,10 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             server->buf->len = server->header_buf->len;
             bfree(server->header_buf);
             ss_free(server->header_buf);
-            server->stage = 2;
+            server->stage = STAGE_PARSE;
         } else {
-            if (ret == -1) server->stage = -1;
+            if (ret == -1)
+                server->stage = STAGE_ERROR;
             server->buf->len = 0;
             server->buf->idx = 0;
             return;
@@ -701,14 +702,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     }
 
     // handshake and transmit data
-    if (server->stage == 5) {
-        if (server->auth && !ss_check_hash(remote->buf, server->chunk, server->d_ctx, BUF_SIZE)) {
-            LOGE("hash error");
-            report_addr(server->fd, BAD);
-            close_and_free_server(EV_A_ server);
-            close_and_free_remote(EV_A_ remote);
-            return;
-        }
+    if (server->stage == STAGE_STREAM) {
         int s = send(remote->fd, remote->buf->array, remote->buf->len, 0);
         if (s == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -728,34 +722,25 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             ev_io_start(EV_A_ & remote->send_ctx->io);
         }
         return;
-    } else if (server->stage == 2) {
+    } else if (server->stage == STAGE_PARSE) {
         /*
          * Shadowsocks TCP Relay Header:
          *
-         *    +------+----------+----------+----------------+
-         *    | ATYP | DST.ADDR | DST.PORT |    HMAC-SHA1   |
-         *    +------+----------+----------+----------------+
-         *    |  1   | Variable |    2     |      10        |
-         *    +------+----------+----------+----------------+
-         *
-         *    If ATYP & ONETIMEAUTH_FLAG(0x10) != 0, Authentication (HMAC-SHA1) is enabled.
-         *
-         *    The key of HMAC-SHA1 is (IV + KEY) and the input is the whole header.
-         *    The output of HMAC-SHA is truncated to 10 bytes (leftmost bits).
+         *    +------+----------+----------+
+         *    | ATYP | DST.ADDR | DST.PORT |
+         *    +------+----------+----------+
+         *    |  1   | Variable |    2     |
+         *    +------+----------+----------+
          */
 
         /*
-         * Shadowsocks Request's Chunk Authentication for TCP Relay's payload
-         * (No chunk authentication for response's payload):
+         * TCP Relay's payload
          *
-         *    +------+-----------+-------------+------+
-         *    | LEN  | HMAC-SHA1 |    DATA     |      ...
-         *    +------+-----------+-------------+------+
-         *    |  2   |    10     |  Variable   |      ...
-         *    +------+-----------+-------------+------+
-         *
-         *    The key of HMAC-SHA1 is (IV + CHUNK ID)
-         *    The output of HMAC-SHA is truncated to 10 bytes (leftmost bits).
+         *    +-------------+------+
+         *    |    DATA     |      ...
+         *    +-------------+------+
+         *    |  Variable   |      ...
+         *    +-------------+------+
          */
 
         int offset     = 0;
@@ -767,27 +752,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         struct sockaddr_storage storage;
         memset(&info, 0, sizeof(struct addrinfo));
         memset(&storage, 0, sizeof(struct sockaddr_storage));
-
-        if (auth || (atyp & ONETIMEAUTH_FLAG)) {
-            size_t header_len = parse_header_len(atyp, server->buf->array, offset);
-            size_t len        = server->buf->len;
-
-            if (header_len == 0 || len < offset + header_len + ONETIMEAUTH_BYTES) {
-                report_addr(server->fd, MALFORMED);
-                close_and_free_server(EV_A_ server);
-                return;
-            }
-
-            server->buf->len = offset + header_len + ONETIMEAUTH_BYTES;
-            if (ss_onetimeauth_verify(server->buf, server->d_ctx->evp.iv)) {
-                report_addr(server->fd, BAD);
-                close_and_free_server(EV_A_ server);
-                return;
-            }
-
-            server->buf->len = len;
-            server->auth     = 1;
-        }
 
         // get remote addr and port
         if ((atyp & ADDRTYPE_MASK) == 1) {
@@ -895,10 +859,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 
         offset += 2;
 
-        if (server->auth) {
-            offset += ONETIMEAUTH_BYTES;
-        }
-
         if (server->buf->len < offset) {
             report_addr(server->fd, MALFORMED);
             close_and_free_server(EV_A_ server);
@@ -915,15 +875,8 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                 LOGI("connect to %s:%d", host, ntohs(port));
         }
 
-        if (server->auth && !ss_check_hash(server->buf, server->chunk, server->d_ctx, BUF_SIZE)) {
-            LOGE("hash error");
-            report_addr(server->fd, BAD);
-            close_and_free_server(EV_A_ server);
-            return;
-        }
-
         if (!need_query) {
-            remote_t *remote = connect_to_remote(&info, server);
+            remote_t *remote = connect_to_remote(EV_A_ &info, server);
 
             if (remote == NULL) {
                 LOGE("connect error");
@@ -942,18 +895,17 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                     server->buf->idx = 0;
                 }
 
-                server->stage = 4;
-
                 // waiting on remote connected event
                 ev_io_stop(EV_A_ & server_recv_ctx->io);
                 ev_io_start(EV_A_ & remote->send_ctx->io);
             }
         } else {
-            query_t *query = (query_t *)ss_malloc(sizeof(query_t));
+            query_t *query = ss_malloc(sizeof(query_t));
+            memset(query, 0, sizeof(query_t));
             query->server = server;
             snprintf(query->hostname, 256, "%s", host);
 
-            server->stage = 4;
+            server->stage = STAGE_RESOLVE;
             server->query = resolv_query(host, server_resolve_cb,
                                          query_free_cb, query, port);
 
@@ -1030,8 +982,8 @@ block_list_clear_cb(EV_P_ ev_timer *watcher, int revents)
 static void
 server_timeout_cb(EV_P_ ev_timer *watcher, int revents)
 {
-    server_ctx_t *server_ctx = (server_ctx_t *)(((void *)watcher)
-                                                - sizeof(ev_io));
+    server_ctx_t *server_ctx
+        = cork_container_of(watcher, server_ctx_t, watcher);
     server_t *server = server_ctx->server;
     remote_t *remote = server->remote;
 
@@ -1039,7 +991,7 @@ server_timeout_cb(EV_P_ ev_timer *watcher, int revents)
         LOGI("TCP connection timeout");
     }
 
-    if (server->stage < 2) {
+    if (server->stage < STAGE_PARSE) {
         if (verbose) {
             size_t len = server->stage ?
                          server->header_buf->len : server->buf->len;
@@ -1095,7 +1047,7 @@ server_resolve_cb(struct sockaddr *addr, void *data)
             info.ai_addrlen = sizeof(struct sockaddr_in6);
         }
 
-        remote_t *remote = connect_to_remote(&info, server);
+        remote_t *remote = connect_to_remote(EV_A_ &info, server);
 
         if (remote == NULL) {
             close_and_free_server(EV_A_ server);
@@ -1160,7 +1112,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     rx += r;
 
     server->buf->len = r;
-    int err = ss_encrypt(server->buf, server->e_ctx, BUF_SIZE);
+    int err = ss_encrypt(&cipher_env, server->buf, server->e_ctx, BUF_SIZE);
 
     if (err) {
         LOGE("invalid password or cipher");
@@ -1210,7 +1162,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
 
     if (!remote_send_ctx->connected) {
         struct sockaddr_storage addr;
-        socklen_t len = sizeof addr;
+        socklen_t len = sizeof(struct sockaddr_storage);
         memset(&addr, 0, len);
         int r = getpeername(remote->fd, (struct sockaddr *)&addr, &len);
         if (r == 0) {
@@ -1223,7 +1175,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
             reset_addr(server->fd);
 
             if (remote->buf->len == 0) {
-                server->stage = 5;
+                server->stage = STAGE_STREAM;
                 ev_io_stop(EV_A_ & remote_send_ctx->io);
                 ev_io_start(EV_A_ & server->recv_ctx->io);
                 ev_io_start(EV_A_ & remote->recv_ctx->io);
@@ -1270,8 +1222,8 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
             ev_io_stop(EV_A_ & remote_send_ctx->io);
             if (server != NULL) {
                 ev_io_start(EV_A_ & server->recv_ctx->io);
-                if (server->stage == 4) {
-                    server->stage = 5;
+                if (server->stage != STAGE_STREAM) {
+                    server->stage = STAGE_STREAM;
                     ev_io_start(EV_A_ & remote->recv_ctx->io);
                 }
             } else {
@@ -1291,12 +1243,15 @@ new_remote(int fd)
         remote_conn++;
     }
 
-    remote_t *remote;
+    remote_t *remote = ss_malloc(sizeof(remote_t));
+    memset(remote, 0, sizeof(remote_t));
 
-    remote                      = ss_malloc(sizeof(remote_t));
     remote->recv_ctx            = ss_malloc(sizeof(remote_ctx_t));
     remote->send_ctx            = ss_malloc(sizeof(remote_ctx_t));
     remote->buf                 = ss_malloc(sizeof(buffer_t));
+    balloc(remote->buf, BUF_SIZE);
+    memset(remote->recv_ctx, 0, sizeof(remote_ctx_t));
+    memset(remote->send_ctx, 0, sizeof(remote_ctx_t));
     remote->fd                  = fd;
     remote->recv_ctx->remote    = remote;
     remote->recv_ctx->connected = 0;
@@ -1306,8 +1261,6 @@ new_remote(int fd)
 
     ev_io_init(&remote->recv_ctx->io, remote_recv_cb, fd, EV_READ);
     ev_io_init(&remote->send_ctx->io, remote_send_cb, fd, EV_WRITE);
-
-    balloc(remote->buf, BUF_SIZE);
 
     return remote;
 }
@@ -1358,12 +1311,16 @@ new_server(int fd, listen_ctx_t *listener)
     server->send_ctx            = ss_malloc(sizeof(server_ctx_t));
     server->buf                 = ss_malloc(sizeof(buffer_t));
     server->header_buf          = ss_malloc(sizeof(buffer_t));
+    memset(server->recv_ctx, 0, sizeof(server_ctx_t));
+    memset(server->send_ctx, 0, sizeof(server_ctx_t));
+    balloc(server->buf, BUF_SIZE);
+    balloc(server->header_buf, BUF_SIZE);
     server->fd                  = fd;
     server->recv_ctx->server    = server;
     server->recv_ctx->connected = 0;
     server->send_ctx->server    = server;
     server->send_ctx->connected = 0;
-    server->stage               = 0;
+    server->stage               = STAGE_INIT;
     server->query               = NULL;
     server->listen_ctx          = listener;
     server->remote              = NULL;
@@ -1371,8 +1328,8 @@ new_server(int fd, listen_ctx_t *listener)
     if (listener->method) {
         server->e_ctx = ss_malloc(sizeof(enc_ctx_t));
         server->d_ctx = ss_malloc(sizeof(enc_ctx_t));
-        enc_ctx_init(listener->method, server->e_ctx, 1);
-        enc_ctx_init(listener->method, server->d_ctx, 0);
+        enc_ctx_init(&cipher_env, server->e_ctx, 1);
+        enc_ctx_init(&cipher_env, server->d_ctx, 0);
     } else {
         server->e_ctx = NULL;
         server->d_ctx = NULL;
@@ -1386,10 +1343,7 @@ new_server(int fd, listen_ctx_t *listener)
     ev_timer_init(&server->recv_ctx->watcher, server_timeout_cb,
                   request_timeout, listener->timeout);
 
-    balloc(server->buf, BUF_SIZE);
-    balloc(server->header_buf, BUF_SIZE);
-
-    server->chunk = (chunk_t *)malloc(sizeof(chunk_t));
+    server->chunk = ss_malloc(sizeof(chunk_t));
     memset(server->chunk, 0, sizeof(chunk_t));
     server->chunk->buf = ss_malloc(sizeof(buffer_t));
     memset(server->chunk->buf, 0, sizeof(buffer_t));
@@ -1415,11 +1369,11 @@ free_server(server_t *server)
         server->remote->server = NULL;
     }
     if (server->e_ctx != NULL) {
-        cipher_context_release(&server->e_ctx->evp);
+        enc_ctx_release(&cipher_env, server->e_ctx);
         ss_free(server->e_ctx);
     }
     if (server->d_ctx != NULL) {
-        cipher_context_release(&server->d_ctx->evp);
+        enc_ctx_release(&cipher_env, server->d_ctx);
         ss_free(server->d_ctx);
     }
     if (server->buf != NULL) {
@@ -1491,8 +1445,11 @@ accept_cb(EV_P_ ev_io *w, int revents)
                 in_white_list = 1;
             }
         }
-        if (!in_white_list && check_block_list(peer_name, 0)) {
+        if (!in_white_list && check_block_list(peer_name)) {
             LOGE("block all requests from %s", peer_name);
+#ifdef __linux__
+            set_linger(serverfd);
+#endif
             close(serverfd);
             return;
         }
@@ -1520,6 +1477,7 @@ main(int argc, char **argv)
     int i, c;
     int pid_flags   = 0;
     int mptcp       = 0;
+    int firewall    = 0;
     int mtu         = 0;
     char *user      = NULL;
     char *password  = NULL;
@@ -1541,8 +1499,11 @@ main(int argc, char **argv)
         { "acl",             required_argument, 0, 0 },
         { "manager-address", required_argument, 0, 0 },
         { "mtu",             required_argument, 0, 0 },
-        { "mptcp",           no_argument,       0, 0 },
         { "help",            no_argument,       0, 0 },
+#ifdef __linux__
+        { "mptcp",           no_argument,       0, 0 },
+        { "firewall",        no_argument,       0, 0 },
+#endif
         {                 0,                 0, 0, 0 }
     };
 
@@ -1565,11 +1526,14 @@ main(int argc, char **argv)
                 mtu = atoi(optarg);
                 LOGI("set MTU to %d", mtu);
             } else if (option_index == 4) {
-                mptcp = 1;
-                LOGI("enable multipath TCP");
-            } else if (option_index == 5) {
                 usage();
                 exit(EXIT_SUCCESS);
+            } else if (option_index == 5) {
+                mptcp = 1;
+                LOGI("enable multipath TCP");
+            } else if (option_index == 6) {
+                firewall = 1;
+                LOGI("enable firewall rules");
             }
             break;
         case 's':
@@ -1628,7 +1592,7 @@ main(int argc, char **argv)
             usage();
             exit(EXIT_SUCCESS);
         case 'A':
-            auth = 1;
+            LOGI("The 'A' argument is deprecate! Ignored.");
             break;
         case '6':
             ipv6first = 1;
@@ -1671,8 +1635,8 @@ main(int argc, char **argv)
         if (timeout == NULL) {
             timeout = conf->timeout;
         }
-        if (auth == 0) {
-            auth = conf->auth;
+        if (user == NULL) {
+            user = conf->user;
         }
         if (mode == TCP_ONLY) {
             mode = conf->mode;
@@ -1695,6 +1659,9 @@ main(int argc, char **argv)
 #endif
         if (conf->nameserver != NULL) {
             nameservers[nameserver_num++] = conf->nameserver;
+        }
+        if (ipv6first == 0) {
+            ipv6first = conf->ipv6_first;
         }
     }
 
@@ -1742,11 +1709,8 @@ main(int argc, char **argv)
         LOGI("using tcp fast open");
 #else
         LOGE("tcp fast open is not supported by this environment");
+        fast_open = 0;
 #endif
-    }
-
-    if (auth) {
-        LOGI("onetime authentication enabled");
     }
 
     if (mode != TCP_ONLY) {
@@ -1775,10 +1739,7 @@ main(int argc, char **argv)
 
     // setup keys
     LOGI("initializing ciphers... %s", method);
-    int m = enc_init(password, method);
-
-    // init block list
-    init_block_list();
+    int m = enc_init(&cipher_env, password, method);
 
     // initialize ev loop
     struct ev_loop *loop = EV_DEFAULT;
@@ -1833,8 +1794,8 @@ main(int argc, char **argv)
 
         // Setup UDP
         if (mode != TCP_ONLY) {
-            init_udprelay(server_host[index], server_port, mtu, m,
-                          auth, atoi(timeout), iface, NULL);
+            init_udprelay(server_host[index], server_port, mtu,
+                          atoi(timeout), iface, NULL, NULL);
         }
 
         if (host && strcmp(host, ":") > 0)
@@ -1852,9 +1813,21 @@ main(int argc, char **argv)
     ev_timer_start(EV_DEFAULT, &block_list_watcher);
 
     // setuid
-    if (user != NULL) {
-        run_as(user);
+    if (user != NULL && ! run_as(user)) {
+        FATAL("failed to switch user");
     }
+
+#ifndef __MINGW32__
+    if (geteuid() == 0){
+        LOGI("running from root user");
+    } else if (firewall) {
+        LOGE("firewall setup requires running from root user");
+        exit(-1);
+    }
+#endif
+
+    // init block list
+    init_block_list(firewall);
 
     // Init connections
     cork_dllist_init(&connections);
@@ -1865,6 +1838,9 @@ main(int argc, char **argv)
     if (verbose) {
         LOGI("closed gracefully");
     }
+
+    // Free block list
+    free_block_list();
 
     if (manager_address != NULL) {
         ev_timer_stop(EV_DEFAULT, &stat_update_watcher);

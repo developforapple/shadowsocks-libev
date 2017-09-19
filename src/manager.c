@@ -98,7 +98,7 @@ build_config(char *prefix, struct server *server)
     char *path    = NULL;
     int path_size = strlen(prefix) + strlen(server->port) + 20;
 
-    path = malloc(path_size);
+    path = ss_malloc(path_size);
     snprintf(path, path_size, "%s/.shadowsocks_%s.conf", prefix, server->port);
     FILE *f = fopen(path, "w+");
     if (f == NULL) {
@@ -159,10 +159,6 @@ construct_command_line(struct manager_ctx *manager, struct server *server)
     if (manager->mode == TCP_AND_UDP) {
         int len = strlen(cmd);
         snprintf(cmd + len, BUF_SIZE - len, " -u");
-    }
-    if (manager->auth) {
-        int len = strlen(cmd);
-        snprintf(cmd + len, BUF_SIZE - len, " -A");
     }
     if (manager->fast_open) {
         int len = strlen(cmd);
@@ -243,7 +239,7 @@ get_server(char *buf, int len)
         return NULL;
     }
 
-    struct server *server = (struct server *)malloc(sizeof(struct server));
+    struct server *server = ss_malloc(sizeof(struct server));
     memset(server, 0, sizeof(struct server));
     if (obj->type == json_object) {
         int i = 0;
@@ -322,7 +318,7 @@ kill_server(char *prefix, char *pid_file)
 {
     char *path = NULL;
     int pid, path_size = strlen(prefix) + strlen(pid_file) + 2;
-    path = malloc(path_size);
+    path = ss_malloc(path_size);
     snprintf(path, path_size, "%s/%s", prefix, pid_file);
     FILE *f = fopen(path, "r");
     if (f == NULL) {
@@ -345,7 +341,7 @@ stop_server(char *prefix, char *port)
 {
     char *path = NULL;
     int pid, path_size = strlen(prefix) + strlen(port) + 20;
-    path = malloc(path_size);
+    path = ss_malloc(path_size);
     snprintf(path, path_size, "%s/.shadowsocks_%s.pid", prefix, port);
     FILE *f = fopen(path, "r");
     if (f == NULL) {
@@ -612,13 +608,12 @@ main(int argc, char **argv)
     char *iface           = NULL;
     char *manager_address = NULL;
 
-    int auth      = 0;
     int fast_open = 0;
     int mode      = TCP_ONLY;
     int mtu       = 0;
 
 #ifdef HAVE_SETRLIMIT
-static int nofile = 0;
+    static int nofile = 0;
 #endif
 
     int server_num = 0;
@@ -709,7 +704,7 @@ static int nofile = 0;
             usage();
             exit(EXIT_SUCCESS);
         case 'A':
-            auth = 1;
+            LOGI("The 'A' argument is deprecate! Ignored.");
             break;
 #ifdef HAVE_SETRLIMIT
         case 'n':
@@ -731,18 +726,25 @@ static int nofile = 0;
     if (conf_path != NULL) {
         conf = read_jconf(conf_path);
         if (server_num == 0) {
-            server_num = conf->remote_num;
-            for (i = 0; i < server_num; i++)
-                server_host[i] = conf->remote_addr[i].host;
+            server_num = conf->server_new_1.server_num;
+            //for (i = 0; i < server_num; i++)
+            //    server_host[i].host = conf->server_new_1.servers[i].server;
+            //    server_host[i].port = conf->server_new_1.servers[i].server_port;
+            //}
+        } else {
+            conf->server_new_1.server_num = 1;
         }
         if (password == NULL) {
-            password = conf->password;
+            password = conf->server_new_1.servers[0].password;
         }
         if (method == NULL) {
-            method = conf->method;
+            method = conf->server_new_1.servers[0].method;
         }
         if (timeout == NULL) {
             timeout = conf->timeout;
+        }
+        if (user == NULL) {
+            user = conf->user;
         }
 #ifdef TCP_FASTOPEN
         if (fast_open == 0) {
@@ -751,9 +753,6 @@ static int nofile = 0;
 #endif
         if (conf->nameserver != NULL) {
             nameservers[nameserver_num++] = conf->nameserver;
-        }
-        if (auth == 0) {
-            auth = conf->auth;
         }
         if (mode == TCP_ONLY) {
             mode = conf->mode;
@@ -798,10 +797,6 @@ static int nofile = 0;
 #endif
     }
 
-    if (auth) {
-        LOGI("onetime authentication enabled");
-    }
-
 #ifdef __MINGW32__
     winsock_init();
 #else
@@ -824,7 +819,6 @@ static int nofile = 0;
     manager.fast_open       = fast_open;
     manager.verbose         = verbose;
     manager.mode            = mode;
-    manager.auth            = auth;
     manager.password        = password;
     manager.timeout         = timeout;
     manager.method          = method;
@@ -838,21 +832,27 @@ static int nofile = 0;
     manager.nameserver_num  = nameserver_num;
     manager.mtu             = mtu;
 #ifdef HAVE_SETRLIMIT
-    manager.nofile          = nofile;
+    manager.nofile = nofile;
 #endif
 
     // initialize ev loop
     struct ev_loop *loop = EV_DEFAULT;
 
     // setuid
-    if (user != NULL) {
-        run_as(user);
+    if (user != NULL && ! run_as(user)) {
+        FATAL("failed to switch user");
     }
+
+#ifndef __MINGW32__
+    if (geteuid() == 0){
+        LOGI("running from root user");
+    }
+#endif
 
     struct passwd *pw   = getpwuid(getuid());
     const char *homedir = pw->pw_dir;
     working_dir_size = strlen(homedir) + 15;
-    working_dir      = malloc(working_dir_size);
+    working_dir      = ss_malloc(working_dir_size);
     snprintf(working_dir, working_dir_size, "%s/.shadowsocks", homedir);
 
     int err = mkdir(working_dir, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
@@ -884,10 +884,12 @@ static int nofile = 0;
     server_table = cork_string_hash_table_new(MAX_PORT_NUM, 0);
 
     if (conf != NULL) {
-        for (i = 0; i < conf->port_password_num; i++) {
-            struct server *server = (struct server *)malloc(sizeof(struct server));
-            strncpy(server->port, conf->port_password[i].port, 8);
-            strncpy(server->password, conf->port_password[i].password, 128);
+        for (i = 0; i < conf->server_new_1.server_num; i++) {
+            struct server *server = ss_malloc(sizeof(struct server));
+            memset(server, 0, sizeof(struct server));
+            //strncpy(server->port, conf->server_new_1.servers[i].server_port, 8);
+            snprintf(server->port, 8, "%d", conf->server_new_1.servers[i].server_port);
+            strncpy(server->password, conf->server_new_1.servers[i].password, 128);
             add_server(&manager, server);
         }
     }

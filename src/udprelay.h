@@ -28,7 +28,7 @@
 
 #include "encrypt.h"
 #include "jconf.h"
-#include "obfs.h"
+#include "obfs/obfs.h"
 
 #ifdef MODULE_REMOTE
 #include "resolv.h"
@@ -45,8 +45,7 @@
 typedef struct server_ctx {
     ev_io io;
     int fd;
-    int method;
-    int auth;
+//    int method;
     int timeout;
     const char *iface;
     struct cache *conn_cache;
@@ -60,6 +59,7 @@ typedef struct server_ctx {
 #ifdef MODULE_REMOTE
     struct ev_loop *loop;
 #endif
+    cipher_env_t* cipher_env;
     // SSR
     obfs *protocol;
     obfs_class *protocol_plugin;

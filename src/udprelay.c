@@ -59,6 +59,7 @@
 #include "netutils.h"
 #include "cache.h"
 #include "udprelay.h"
+#include "encrypt.h"
 
 #ifdef MODULE_REMOTE
 #define MAX_UDP_CONN_NUM 512
@@ -91,8 +92,13 @@ static void query_resolve_cb(struct sockaddr *addr, void *data);
 static void close_and_free_remote(EV_P_ remote_ctx_t *ctx);
 static remote_ctx_t *new_remote(int fd, server_ctx_t *server_ctx);
 
-extern int verbose;
+#ifdef ANDROID
+extern uint64_t tx;
+extern uint64_t rx;
 extern int vpn;
+#endif
+
+extern int verbose;
 #ifdef MODULE_REMOTE
 extern uint64_t tx;
 extern uint64_t rx;
@@ -339,7 +345,7 @@ create_remote_socket(int ipv6)
     if (ipv6) {
         // Try to bind IPv6 first
         struct sockaddr_in6 addr;
-        memset(&addr, 0, sizeof(addr));
+        memset(&addr, 0, sizeof(struct sockaddr_in6));
         addr.sin6_family = AF_INET6;
         addr.sin6_addr   = in6addr_any;
         addr.sin6_port   = 0;
@@ -355,7 +361,7 @@ create_remote_socket(int ipv6)
     } else {
         // Or else bind to IPv4
         struct sockaddr_in addr;
-        memset(&addr, 0, sizeof(addr));
+        memset(&addr, 0, sizeof(struct sockaddr_in));
         addr.sin_family      = AF_INET;
         addr.sin_addr.s_addr = INADDR_ANY;
         addr.sin_port        = 0;
@@ -544,8 +550,8 @@ close_and_free_remote(EV_P_ remote_ctx_t *ctx)
 static void
 remote_timeout_cb(EV_P_ ev_timer *watcher, int revents)
 {
-    remote_ctx_t *remote_ctx = (remote_ctx_t *)(((void *)watcher)
-                                                - sizeof(ev_io));
+    remote_ctx_t *remote_ctx
+        = cork_container_of(watcher, remote_ctx_t, watcher);
 
     if (verbose) {
         LOGI("[udp] connection timeout");
@@ -659,7 +665,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     }
 
     struct sockaddr_storage src_addr;
-    socklen_t src_addr_len = sizeof(src_addr);
+    socklen_t src_addr_len = sizeof(struct sockaddr_storage);
     memset(&src_addr, 0, src_addr_len);
 
     buffer_t *buf = ss_malloc(sizeof(buffer_t));
@@ -681,7 +687,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     buf->len = r;
 
 #ifdef MODULE_LOCAL
-    int err = ss_decrypt_all(buf, server_ctx->method, 0, buf_size);
+    int err = ss_decrypt_all(server_ctx->cipher_env, buf, buf_size);
     if (err) {
         // drop the packet silently
         goto CLEAN_UP;
@@ -732,18 +738,21 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
 
     // server may return using a different address type other than the type we
     // have used during sending
-
 #if defined(MODULE_TUNNEL) || defined(MODULE_REDIR)
     // Construct packet
     buf->len -= len;
     memmove(buf->array, buf->array + len, buf->len);
 #else
+#ifdef ANDROID
+    rx += buf->len;
+#endif
     // Construct packet
     brealloc(buf, buf->len + 3, buf_size);
     memmove(buf->array + 3, buf->array, buf->len);
     memset(buf->array, 0, 3);
     buf->len += 3;
 #endif
+
 #endif
 
 #ifdef MODULE_REMOTE
@@ -765,11 +774,12 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     memcpy(buf->array, addr_header, addr_header_len);
     buf->len += addr_header_len;
 
-    int err = ss_encrypt_all(buf, server_ctx->method, 0, buf_size);
+    int err = ss_decrypt_all(server_ctx->cipher_env, buf, buf_size);
     if (err) {
         // drop the packet silently
         goto CLEAN_UP;
     }
+
 #endif
 
     if (buf->len > packet_size) {
@@ -780,6 +790,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     size_t remote_src_addr_len = get_sockaddr_len((struct sockaddr *)&remote_ctx->src_addr);
 
 #ifdef MODULE_REDIR
+
     size_t remote_dst_addr_len = get_sockaddr_len((struct sockaddr *)&dst_addr);
 
     int src_fd = socket(remote_ctx->src_addr.ss_family, SOCK_DGRAM, 0);
@@ -819,12 +830,14 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     close(src_fd);
 
 #else
+
     int s = sendto(server_ctx->fd, buf->array, buf->len, 0,
                    (struct sockaddr *)&remote_ctx->src_addr, remote_src_addr_len);
     if (s == -1) {
         ERROR("[udp] remote_recv_sendto");
         goto CLEAN_UP;
     }
+
 #endif
 
     // handle the UDP packet successfully,
@@ -853,6 +866,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 #ifdef MODULE_REDIR
     char control_buffer[64] = { 0 };
     struct msghdr msg;
+    memset(&msg, 0, sizeof(struct msghdr));
     struct iovec iov[1];
     struct sockaddr_storage dst_addr;
     memset(&dst_addr, 0, sizeof(struct sockaddr_storage));
@@ -901,10 +915,9 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 #endif
 
 #ifdef MODULE_REMOTE
-
     tx += buf->len;
 
-    int err = ss_decrypt_all(buf, server_ctx->method, server_ctx->auth, buf_size);
+    int err = ss_decrypt_all(server_ctx->cipher_env, buf, buf_size);
     if (err) {
         // drop the packet silently
         goto CLEAN_UP;
@@ -913,6 +926,9 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 
 #ifdef MODULE_LOCAL
 #if !defined(MODULE_TUNNEL) && !defined(MODULE_REDIR)
+#ifdef ANDROID
+    tx += buf->len;
+#endif
     uint8_t frag = *(uint8_t *)(buf->array + 2);
     offset += 3;
 #endif
@@ -935,16 +951,11 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
      * +----+------+------+----------+----------+----------+
      *
      * shadowsocks UDP Request (before encrypted)
-     * +------+----------+----------+----------+-------------+
-     * | ATYP | DST.ADDR | DST.PORT |   DATA   |  HMAC-SHA1  |
-     * +------+----------+----------+----------+-------------+
-     * |  1   | Variable |    2     | Variable |     10      |
-     * +------+----------+----------+----------+-------------+
-     *
-     * If ATYP & ONETIMEAUTH_FLAG(0x10) != 0, Authentication (HMAC-SHA1) is enabled.
-     *
-     * The key of HMAC-SHA1 is (IV + KEY) and the input is the whole packet.
-     * The output of HMAC-SHA is truncated to 10 bytes (leftmost bits).
+     * +------+----------+----------+----------+
+     * | ATYP | DST.ADDR | DST.PORT |   DATA   |
+     * +------+----------+----------+----------+
+     * |  1   | Variable |    2     | Variable |
+     * +------+----------+----------+----------+
      *
      * shadowsocks UDP Response (before encrypted)
      * +------+----------+----------+----------+
@@ -999,6 +1010,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         if (ip.version == 4) {
             // send as IPv4
             struct in_addr host_addr;
+            memset(&host_addr, 0, sizeof(struct in_addr));
             int host_len = sizeof(struct in_addr);
 
             if (dns_pton(AF_INET, host, &host_addr) == -1) {
@@ -1010,6 +1022,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         } else if (ip.version == 6) {
             // send as IPv6
             struct in6_addr host_addr;
+            memset(&host_addr, 0, sizeof(struct in6_addr));
             int host_len = sizeof(struct in6_addr);
 
             if (dns_pton(AF_INET6, host, &host_addr) == -1) {
@@ -1172,10 +1185,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         memmove(buf->array, buf->array + offset, buf->len);
     }
 
-    if (server_ctx->auth) {
-        buf->array[0] |= ONETIMEAUTH_FLAG;
-    }
-
     // SSR beg
     if (server_ctx->protocol_plugin) {
         obfs_class *protocol_plugin = server_ctx->protocol_plugin;
@@ -1185,7 +1194,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     }
     //SSR end
 
-    int err = ss_encrypt_all(buf, server_ctx->method, server_ctx->auth, buf->len);
+    int err = ss_encrypt_all(server_ctx->cipher_env, buf, buf->len);
 
     if (err) {
         // drop the packet silently
@@ -1283,7 +1292,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         }
     } else {
         struct addrinfo hints;
-        memset(&hints, 0, sizeof(hints));
+        memset(&hints, 0, sizeof(struct addrinfo));
         hints.ai_family   = AF_UNSPEC;
         hints.ai_socktype = SOCK_DGRAM;
         hints.ai_protocol = IPPROTO_UDP;
@@ -1316,7 +1325,7 @@ CLEAN_UP:
 }
 
 void
-free_cb(void *element)
+free_cb(void *key, void *element)
 {
     remote_ctx_t *remote_ctx = (remote_ctx_t *)element;
 
@@ -1335,7 +1344,8 @@ init_udprelay(const char *server_host, const char *server_port,
               const ss_addr_t tunnel_addr,
 #endif
 #endif
-              int mtu, int method, int auth, int timeout, const char *iface, const char *protocol)
+              int mtu, int timeout, const char *iface,
+              cipher_env_t* cipher_env, const char *protocol, const char *protocol_param)
 {
     // Initialize ev loop
     struct ev_loop *loop = EV_DEFAULT;
@@ -1359,18 +1369,14 @@ init_udprelay(const char *server_host, const char *server_port,
         FATAL("[udp] bind() error");
     }
     setnonblocking(serverfd);
-    if (protocol != NULL && strcmp(protocol, "verify_sha1") == 0) {
-        auth = 1;
-        protocol = NULL;
-    }
 
     server_ctx_t *server_ctx = new_server_ctx(serverfd);
+
+    server_ctx->cipher_env = cipher_env;
 #ifdef MODULE_REMOTE
     server_ctx->loop = loop;
 #endif
-    server_ctx->auth       = auth;
     server_ctx->timeout    = max(timeout, MIN_UDP_TIMEOUT);
-    server_ctx->method     = method;
     server_ctx->iface      = iface;
     server_ctx->conn_cache = conn_cache;
 #ifdef MODULE_LOCAL
@@ -1389,8 +1395,9 @@ init_udprelay(const char *server_host, const char *server_port,
     _server_info.port = ((struct sockaddr_in*)remote_addr)->sin_port;
     _server_info.port = _server_info.port >> 8 | _server_info.port << 8;
     _server_info.g_data = server_ctx->protocol_global;
-    _server_info.key = enc_get_key();
-    _server_info.key_len = enc_get_key_len();
+    _server_info.param = (char *)protocol_param;
+    _server_info.key = enc_get_key(cipher_env);
+    _server_info.key_len = enc_get_key_len(cipher_env);
 
     if (server_ctx->protocol_plugin)
         server_ctx->protocol_plugin->set_server_info(server_ctx->protocol, &_server_info);

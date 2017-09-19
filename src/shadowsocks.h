@@ -43,7 +43,6 @@ typedef struct {
     int use_sys_log;            // file path to log
     int fast_open;        // enable tcp fast open
     int mode;             // enable udp relay
-    int auth;             // enable one-time authentication
     int mtu;              // MTU of interface
     int mptcp;            // enable multipath TCP
     int verbose;          // verbose mode
@@ -63,7 +62,6 @@ typedef struct {
  *  .log = NULL,
  *  .fast_open = 0,
  *  .mode = 0,
- *  .auth = 0,
  *  .verbose = 0
  * };
  */

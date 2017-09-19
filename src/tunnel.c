@@ -71,7 +71,7 @@
 #define BUF_SIZE 2048
 #endif
 
-#include "obfs.c" // I don't want to modify makefile
+#include "includeobfs.h" // I don't want to modify makefile
 
 static void accept_cb(EV_P_ ev_io *w, int revents);
 static void server_recv_cb(EV_P_ ev_io *w, int revents);
@@ -95,8 +95,8 @@ char *prefix;
 int verbose        = 0;
 int keep_resolving = 1;
 
+static int ipv6first = 0;
 static int mode = TCP_ONLY;
-static int auth = 0;
 #ifdef HAVE_SETRLIMIT
 static int nofile = 0;
 #endif
@@ -202,10 +202,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 
     remote->buf->len = r;
 
-    if (auth) {
-        ss_gen_hash(remote->buf, &remote->counter, server->e_ctx, BUF_SIZE);
-    }
-
     // SSR beg
     if (server->protocol_plugin) {
         obfs_class *protocol_plugin = server->protocol_plugin;
@@ -213,7 +209,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             remote->buf->len = protocol_plugin->client_pre_encrypt(server->protocol, &remote->buf->array, remote->buf->len, &remote->buf->capacity);
         }
     }
-    int err = ss_encrypt(remote->buf, server->e_ctx, BUF_SIZE);
+    int err = ss_encrypt(&cipher_env, remote->buf, server->e_ctx, BUF_SIZE);
 
     if (err) {
         LOGE("server invalid password or cipher");
@@ -229,6 +225,12 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         }
     }
     // SSR end
+
+    if (r > 0 && remote->buf->len == 0) { // SSR pause recv
+         remote->buf->idx = 0;
+         ev_io_stop(EV_A_ & server_recv_ctx->io);
+         return;
+    }
 
     int s = send(remote->fd, remote->buf->array, remote->buf->len, 0);
 
@@ -300,8 +302,9 @@ server_send_cb(EV_P_ ev_io *w, int revents)
 static void
 remote_timeout_cb(EV_P_ ev_timer *watcher, int revents)
 {
-    remote_ctx_t *remote_ctx = (remote_ctx_t *)(((void *)watcher)
-                                                - sizeof(ev_io));
+    remote_ctx_t *remote_ctx
+        = cork_container_of(watcher, remote_ctx_t, watcher);
+
     remote_t *remote = remote_ctx->remote;
     server_t *server = remote->server;
 
@@ -357,21 +360,38 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
                 return;
             }
             if (needsendback) {
-                size_t capacity = BUF_SIZE;
-                char *buf = (char*)malloc(capacity);
                 obfs_class *obfs_plugin = server->obfs_plugin;
                 if (obfs_plugin->client_encode) {
-                    int len = obfs_plugin->client_encode(server->obfs, &buf, 0, &capacity);
-                    send(remote->fd, buf, len, 0);
+                    remote->buf->len = obfs_plugin->client_encode(server->obfs, &remote->buf->array, 0, &remote->buf->capacity);
+                    ssize_t s = send(remote->fd, remote->buf->array, remote->buf->len, 0);
+                    if (s == -1) {
+                        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                            ERROR("remote_send_cb_send");
+                            // close and free
+                            close_and_free_remote(EV_A_ remote);
+                            close_and_free_server(EV_A_ server);
+                        }
+                        return;
+                    } else if (s < (ssize_t)(remote->buf->len)) {
+                        // partly sent, move memory, wait for the next time to send
+                        remote->buf->len -= s;
+                        remote->buf->idx += s;
+                        return;
+                    } else {
+                        // all sent out, wait for reading
+                        remote->buf->len = 0;
+                        remote->buf->idx = 0;
+                        ev_io_stop(EV_A_ & remote->send_ctx->io);
+                        ev_io_start(EV_A_ & server->recv_ctx->io);
+                    }
                 }
-                free(buf);
             }
         }
     }
     if ( server->buf->len == 0 )
         return;
 
-    int err = ss_decrypt(server->buf, server->d_ctx, BUF_SIZE);
+    int err = ss_decrypt(&cipher_env, server->buf, server->d_ctx, BUF_SIZE);
 
     if (err) {
         LOGE("invalid password or cipher");
@@ -415,11 +435,6 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
         ev_io_stop(EV_A_ & remote_recv_ctx->io);
         ev_io_start(EV_A_ & server->send_ctx->io);
     }
-
-    // Disable TCP_NODELAY after the first response are sent
-    int opt = 0;
-    setsockopt(server->fd, SOL_TCP, TCP_NODELAY, &opt, sizeof(opt));
-    setsockopt(remote->fd, SOL_TCP, TCP_NODELAY, &opt, sizeof(opt));
 }
 
 static void
@@ -431,7 +446,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
 
     if (!remote_send_ctx->connected) {
         struct sockaddr_storage addr;
-        socklen_t len = sizeof addr;
+        socklen_t len = sizeof(struct sockaddr_storage);
 
         int r = getpeername(remote->fd, (struct sockaddr *)&addr, &len);
         if (r == 0) {
@@ -449,6 +464,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
                 if (ip.version == 4) {
                     // send as IPv4
                     struct in_addr host;
+                    memset(&host, 0, sizeof(struct in_addr));
                     int host_len = sizeof(struct in_addr);
 
                     if (dns_pton(AF_INET, sa->host, &host) == -1) {
@@ -460,6 +476,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
                 } else if (ip.version == 6) {
                     // send as IPv6
                     struct in6_addr host;
+                    memset(&host, 0, sizeof(struct in6_addr));
                     int host_len = sizeof(struct in6_addr);
 
                     if (dns_pton(AF_INET6, sa->host, &host) == -1) {
@@ -484,11 +501,6 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
             uint16_t port = htons(atoi(sa->port));
             memcpy(abuf->array + abuf->len, &port, 2);
             abuf->len += 2;
-
-            if (auth) {
-                abuf->array[0] |= ONETIMEAUTH_FLAG;
-                ss_onetimeauth(abuf, server->e_ctx->evp.iv, BUF_SIZE);
-            }
 
             if (remote->buf->len > 0) {
                 brealloc(remote->buf, remote->buf->len + abuf->len, BUF_SIZE);
@@ -516,7 +528,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
                 }
             }
 
-            int err = ss_encrypt(remote->buf, server->e_ctx, BUF_SIZE);
+            int err = ss_encrypt(&cipher_env, remote->buf, server->e_ctx, BUF_SIZE);
             if (err) {
                 LOGE("invalid password or cipher");
                 close_and_free_remote(EV_A_ remote);
@@ -591,14 +603,16 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
 static remote_t *
 new_remote(int fd, int timeout)
 {
-    remote_t *remote;
-    remote = ss_malloc(sizeof(remote_t));
+    remote_t *remote = ss_malloc(sizeof(remote_t));
 
     memset(remote, 0, sizeof(remote_t));
 
     remote->buf                 = ss_malloc(sizeof(buffer_t));
     remote->recv_ctx            = ss_malloc(sizeof(remote_ctx_t));
     remote->send_ctx            = ss_malloc(sizeof(remote_ctx_t));
+    balloc(remote->buf, BUF_SIZE);
+    memset(remote->recv_ctx, 0, sizeof(remote_ctx_t));
+    memset(remote->send_ctx, 0, sizeof(remote_ctx_t));
     remote->fd                  = fd;
     remote->recv_ctx->remote    = remote;
     remote->recv_ctx->connected = 0;
@@ -609,8 +623,6 @@ new_remote(int fd, int timeout)
     ev_io_init(&remote->send_ctx->io, remote_send_cb, fd, EV_WRITE);
     ev_timer_init(&remote->send_ctx->watcher, remote_timeout_cb,
                   min(MAX_CONNECT_TIMEOUT, timeout), 0);
-
-    balloc(remote->buf, BUF_SIZE);
 
     return remote;
 }
@@ -647,12 +659,15 @@ close_and_free_remote(EV_P_ remote_t *remote)
 static server_t *
 new_server(int fd, int method)
 {
-    server_t *server;
+    server_t *server = ss_malloc(sizeof(server_t));
+    memset(server, 0, sizeof(server_t));
 
-    server                      = ss_malloc(sizeof(server_t));
     server->buf                 = ss_malloc(sizeof(buffer_t));
     server->recv_ctx            = ss_malloc(sizeof(server_ctx_t));
     server->send_ctx            = ss_malloc(sizeof(server_ctx_t));
+    balloc(server->buf, BUF_SIZE);
+    memset(server->recv_ctx, 0, sizeof(server_ctx_t));
+    memset(server->send_ctx, 0, sizeof(server_ctx_t));
     server->fd                  = fd;
     server->recv_ctx->server    = server;
     server->recv_ctx->connected = 0;
@@ -662,14 +677,12 @@ new_server(int fd, int method)
     if (method) {
         server->e_ctx = ss_malloc(sizeof(struct enc_ctx));
         server->d_ctx = ss_malloc(sizeof(struct enc_ctx));
-        enc_ctx_init(method, server->e_ctx, 1);
-        enc_ctx_init(method, server->d_ctx, 0);
+        enc_ctx_init(&cipher_env, server->e_ctx, 1);
+        enc_ctx_init(&cipher_env, server->d_ctx, 0);
     } else {
         server->e_ctx = NULL;
         server->d_ctx = NULL;
     }
-
-    balloc(server->buf, BUF_SIZE);
 
     ev_io_init(&server->recv_ctx->io, server_recv_cb, fd, EV_READ);
     ev_io_init(&server->send_ctx->io, server_send_cb, fd, EV_WRITE);
@@ -685,11 +698,11 @@ free_server(server_t *server)
             server->remote->server = NULL;
         }
         if (server->e_ctx != NULL) {
-            cipher_context_release(&server->e_ctx->evp);
+            enc_ctx_release(&cipher_env, server->e_ctx);
             ss_free(server->e_ctx);
         }
         if (server->d_ctx != NULL) {
-            cipher_context_release(&server->d_ctx->evp);
+            enc_ctx_release(&cipher_env, server->d_ctx);
             ss_free(server->d_ctx);
         }
         if (server->buf) {
@@ -805,7 +818,7 @@ accept_cb(EV_P_ ev_io *w, int revents)
         close_and_free_server(EV_A_ server);
         return;
     }
-
+    
     // listen to remote connected event
     ev_io_start(EV_A_ & remote->send_ctx->io);
     ev_timer_start(EV_A_ & remote->send_ctx->watcher);
@@ -833,6 +846,7 @@ main(int argc, char **argv)
     char *password   = NULL;
     char *timeout    = NULL;
     char *protocol = NULL; // SSR
+    char *protocol_param = NULL; // SSR
     char *method = NULL;
     char *obfs = NULL; // SSR
     char *obfs_param = NULL; // SSR
@@ -860,10 +874,12 @@ main(int argc, char **argv)
     USE_TTY();
 
 #ifdef ANDROID
-    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:i:c:b:L:a:n:P:O:o:G:g:huUvVA", // SSR
+    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:i:c:b:L:a:n:P:huUvVA6"
+                            "O:o:G:g:",
                             long_options, &option_index)) != -1) {
 #else
-    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:i:c:b:L:a:n:O:o:G:g:huUvA", // SSR
+    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:i:c:b:L:a:n:huUvA6"
+                            "O:o:G:g:",
                             long_options, &option_index)) != -1) {
 #endif
         switch (c) {
@@ -912,6 +928,7 @@ main(int argc, char **argv)
             obfs = optarg;
             break;
         case 'G':
+            protocol_param = optarg;
             break;
         case 'g':
             obfs_param = optarg;
@@ -950,7 +967,10 @@ main(int argc, char **argv)
             usage();
             exit(EXIT_SUCCESS);
         case 'A':
-            auth = 1;
+            LOGI("The 'A' argument is deprecate! Ignored.");
+            break;
+        case '6':
+            ipv6first = 1;
             break;
 #ifdef ANDROID
         case 'V':
@@ -1003,6 +1023,10 @@ main(int argc, char **argv)
             protocol = conf->protocol;
             LOGI("protocol %s", protocol);
         }
+        if (protocol_param == NULL) {
+            protocol_param = conf->protocol_param;
+            LOGI("protocol_param %s", protocol_param);
+        }
         if (method == NULL) {
             method = conf->method;
             LOGI("method %s", method);
@@ -1019,8 +1043,8 @@ main(int argc, char **argv)
         if (timeout == NULL) {
             timeout = conf->timeout;
         }
-        if (auth == 0) {
-            auth = conf->auth;
+        if (user == NULL) {
+            user = conf->user;
         }
         if (tunnel_addr_str == NULL) {
             tunnel_addr_str = conf->tunnel_address;
@@ -1041,7 +1065,7 @@ main(int argc, char **argv)
 #endif
     }
     if (protocol && strcmp(protocol, "verify_sha1") == 0) {
-        auth = 1;
+        LOGI("The verify_sha1 protocol is deprecate! Fallback to origin protocol.");
         protocol = NULL;
     }
 
@@ -1081,8 +1105,8 @@ main(int argc, char **argv)
         daemonize(pid_path);
     }
 
-    if (auth) {
-        LOGI("onetime authentication enabled");
+    if (ipv6first) {
+        LOGI("resolving hostname to IPv6 address first");
     }
 
     // parse tunnel addr
@@ -1104,20 +1128,22 @@ main(int argc, char **argv)
 
     // Setup keys
     LOGI("initializing ciphers... %s", method);
-    int m = enc_init(password, method);
+    int m = enc_init(&cipher_env, password, method);
 
     // Setup proxy context
     struct listen_ctx listen_ctx;
+    memset(&listen_ctx, 0, sizeof(struct listen_ctx));
     listen_ctx.tunnel_addr = tunnel_addr;
     listen_ctx.remote_num  = remote_num;
     listen_ctx.remote_addr = ss_malloc(sizeof(struct sockaddr *) * remote_num);
+    memset(listen_ctx.remote_addr, 0, sizeof(struct sockaddr *) * remote_num);
     for (i = 0; i < remote_num; i++) {
         char *host = remote_addr[i].host;
         char *port = remote_addr[i].port == NULL ? remote_port :
                      remote_addr[i].port;
         struct sockaddr_storage *storage = ss_malloc(sizeof(struct sockaddr_storage));
         memset(storage, 0, sizeof(struct sockaddr_storage));
-        if (get_sockaddr(host, port, storage, 1) == -1) {
+        if (get_sockaddr(host, port, storage, 1, ipv6first) == -1) {
             FATAL("failed to resolve the provided hostname");
         }
         listen_ctx.remote_addr[i] = (struct sockaddr *)storage;
@@ -1126,6 +1152,7 @@ main(int argc, char **argv)
     listen_ctx.iface   = iface;
     // SSR beg
     listen_ctx.protocol_name = protocol;
+    listen_ctx.protocol_param = protocol_param;
     listen_ctx.method = m;
     listen_ctx.obfs_name = obfs;
     listen_ctx.obfs_param = obfs_param;
@@ -1161,7 +1188,7 @@ main(int argc, char **argv)
         LOGI("UDP relay enabled");
         init_udprelay(local_addr, local_port, listen_ctx.remote_addr[0],
                       get_sockaddr_len(listen_ctx.remote_addr[0]),
-                      tunnel_addr, mtu, m, auth, listen_ctx.timeout, iface, protocol);
+                      tunnel_addr, mtu, listen_ctx.timeout, iface, protocol, protocol_param);
     }
 
     if (mode == UDP_ONLY) {
@@ -1171,9 +1198,15 @@ main(int argc, char **argv)
     LOGI("listening at %s:%s", local_addr, local_port);
 
     // setuid
-    if (user != NULL) {
-        run_as(user);
+    if (user != NULL && ! run_as(user)) {
+        FATAL("failed to switch user");
     }
+
+#ifndef __MINGW32__
+    if (geteuid() == 0){
+        LOGI("running from root user");
+    }
+#endif
 
     ev_run(loop, 0);
 

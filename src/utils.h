@@ -38,6 +38,7 @@
 #ifndef _UTILS_H
 #define _UTILS_H
 
+#include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
@@ -209,11 +210,13 @@ void ERROR(const char *s);
 #endif
 
 char *ss_itoa(int i);
+int ss_isnumeric(const char *s);
 int run_as(const char *user);
 void FATAL(const char *msg);
 void usage(void);
 void daemonize(const char *path);
 char *ss_strndup(const char *s, size_t n);
+char *ss_strdup(const char *s);
 #ifdef HAVE_SETRLIMIT
 int set_nofile(int nofile);
 #endif

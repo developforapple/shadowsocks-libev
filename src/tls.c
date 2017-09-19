@@ -40,7 +40,7 @@
 #ifndef __MINGW32__
 #include <sys/socket.h>
 #else
-#include <win32.h>
+#include "win32.h"
 #endif
 
 #include "tls.h"
@@ -121,7 +121,7 @@ parse_tls_header(const char *data, size_t data_len, char **hostname)
     if (tls_version_major < 3) {
         if (verbose)
             LOGI("Received SSL %d.%d handshake which can not support SNI.",
-                    tls_version_major, tls_version_minor);
+                 tls_version_major, tls_version_minor);
 
         return -2;
     }
@@ -251,7 +251,7 @@ parse_server_name_extension(const char *data, size_t data_len,
         default:
             if (verbose)
                 LOGI("Unknown server name extension name type: %d",
-                        data[pos]);
+                     data[pos]);
         }
         pos += 3 + len;
     }

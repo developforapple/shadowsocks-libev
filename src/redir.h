@@ -25,8 +25,10 @@
 
 #include <ev.h>
 #include "encrypt.h"
-#include "obfs.h"
+#include "obfs/obfs.h"
 #include "jconf.h"
+
+#include "common.h"
 
 typedef struct listen_ctx {
     ev_io io;
@@ -39,6 +41,7 @@ typedef struct listen_ctx {
 
     // SSR
     char *protocol_name;
+    char *protocol_param;
     char *obfs_name;
     char *obfs_param;
     void **list_protocol_global;
